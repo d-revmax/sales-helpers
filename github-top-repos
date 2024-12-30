@@ -1,0 +1,323 @@
+/**
+ * Main entry point.
+ * 1. Reads large star range from "Input" sheet,
+ * 2. Splits into chunks of 500,
+ * 3. Fetches each chunk into a temporary sheet,
+ * 4. Combines all chunk sheets into one master sheet,
+ * 5. Deletes the temporary sheets.
+ */
+function fetchAllRanges() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var inputSheet = ss.getSheetByName("Input");
+  
+  // Read minStar and maxStar from Input sheet
+  var minStar = inputSheet.getRange("A2").getValue();  // e.g. 20001
+  var maxStar = inputSheet.getRange("B2").getValue();  // e.g. 25000
+  
+  // The chunk size (step)
+  var chunkSize = 500;
+  
+  // Validate inputs
+  if (!minStar || !maxStar || minStar >= maxStar) {
+    Logger.log("[ERROR] Invalid star range. Check 'Input' sheet.");
+    return;
+  }
+  
+  var currentStart = minStar;
+  var tempSheets = []; // We'll keep track of the sheet names created
+
+  // 1) Loop in steps of 500
+  while (currentStart <= maxStar) {
+    // End of this chunk is either currentStart+chunkSize-1 or maxStar
+    var currentEnd = Math.min(currentStart + chunkSize - 1, maxStar);
+    
+    Logger.log("[INFO] Processing chunk " + currentStart + ".." + currentEnd);
+    
+    // 2) Fetch & write to a new (temporary) sheet
+    var sheetName = fetchGitHubReposInRange(currentStart, currentEnd);
+    tempSheets.push(sheetName);
+    
+    // Move to the next chunk
+    currentStart = currentEnd + 1;
+  }
+  
+  Logger.log("[INFO] Done splitting range " + minStar + ".." + maxStar + " in steps of " + chunkSize);
+  
+  // 3) Combine all temporary chunk sheets into one master sheet
+  var masterSheetName = "AllRepos_" + minStar + "_to_" + maxStar;
+  combineSheetsIntoMaster(tempSheets, masterSheetName);
+  
+  Logger.log("[INFO] Done. See master sheet: " + masterSheetName);
+}
+
+
+/**
+ * Fetches repos for a sub-range of stars,
+ * writes them to a newly inserted (temporary) sheet,
+ * applies retries, etc.
+ *
+ * Returns the final sheet name created (so we can later combine).
+ *
+ * @param {number} subMinStar - The start of this chunk
+ * @param {number} subMaxStar - The end of this chunk
+ * @return {string} The final name of the sheet that was created/renamed
+ */
+function fetchGitHubReposInRange(subMinStar, subMaxStar) {
+  var GITHUB_TOKEN = "ghp_YOUR_GITHUB_PERSONAL_ACCESS_TOKEN";
+  
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var tempSheetName = "temp_repos_" + subMinStar + "_" + subMaxStar;
+  var outputSheet = ss.insertSheet(tempSheetName);
+  
+  // Write the header row
+  outputSheet.getRange(1, 1, 1, 5).setValues([[
+    "Repo URL", "Number of Stars", "Website URL", "Last Activity Date", "Cursor"
+  ]]);
+  
+  // GraphQL query (same as before, with pagination)
+  var graphqlQuery = `
+    query($searchQuery: String!, $first: Int!, $after: String) {
+      search(query: $searchQuery, type: REPOSITORY, first: $first, after: $after) {
+        repositoryCount
+        pageInfo {
+          endCursor
+          hasNextPage
+        }
+        edges {
+          node {
+            ... on Repository {
+              url
+              homepageUrl
+              stargazers {
+                totalCount
+              }
+              updatedAt
+            }
+          }
+        }
+      }
+    }
+  `;
+  
+  // Exclude forks, sort by stars desc
+  var searchQueryStr = "stars:" + subMinStar + ".." + subMaxStar + " fork:false sort:stars-desc";
+  
+  // Pagination variables
+  var afterCursor = null;
+  var hasNextPage = true;
+  var pageSize = 100;           // max allowed by GitHub for a search
+  var totalFetched = 0;
+  var maxTotalToFetch = 1000;   // stop after fetching up to 1000 repos in this chunk
+  var repositoryCount = 0;      // reported by GitHub
+  var breakAt = "";             // last known cursor
+  
+  // Next row to write in the output sheet
+  var currentRow = 2;
+  
+  try {
+    // Pagination loop
+    while (hasNextPage) {
+      var variables = {
+        searchQuery: searchQueryStr,
+        first: pageSize
+      };
+      if (afterCursor) {
+        variables.after = afterCursor;
+      }
+
+      var payload = JSON.stringify({
+        query: graphqlQuery,
+        variables: variables
+      });
+      
+      // Attempt a request with retries
+      var response = fetchGraphQLWithRetries(payload, GITHUB_TOKEN, 3);
+      if (!response) {
+        Logger.log("[ERROR] All retries failed for chunk " + subMinStar + ".." + subMaxStar);
+        break;
+      }
+      
+      // Parse JSON
+      var data = JSON.parse(response.getContentText());
+      if (data.errors) {
+        Logger.log("[ERROR] GraphQL errors: " + JSON.stringify(data.errors));
+        break;
+      }
+      
+      var searchData = data.data.search;
+      repositoryCount = searchData.repositoryCount || 0;
+      var edges = searchData.edges || [];
+      var pageInfo = searchData.pageInfo;
+      
+      // Write these edges to sheet
+      var rowsToWrite = [];
+      for (var i = 0; i < edges.length; i++) {
+        var repo = edges[i].node;
+        rowsToWrite.push([
+          repo.url,
+          repo.stargazers.totalCount,
+          repo.homepageUrl || "",
+          repo.updatedAt,
+          afterCursor || ""
+        ]);
+      }
+      
+      if (rowsToWrite.length > 0) {
+        outputSheet
+          .getRange(currentRow, 1, rowsToWrite.length, 5)
+          .setValues(rowsToWrite);
+        currentRow += rowsToWrite.length;
+      }
+      
+      totalFetched += edges.length;
+      Logger.log("[DEBUG] Fetched " + edges.length + " repos in chunk " + subMinStar + ".." + subMaxStar + 
+                 ". Total so far: " + totalFetched);
+      
+      // Update pagination
+      hasNextPage = pageInfo.hasNextPage;
+      afterCursor = pageInfo.endCursor;
+      breakAt = afterCursor || "";
+      
+      // If we've hit our limit for this chunk, stop
+      if (totalFetched >= maxTotalToFetch) {
+        Logger.log("[INFO] Reached the maximum of " + maxTotalToFetch + " for chunk " +
+                   subMinStar + ".." + subMaxStar + ". Stopping early.");
+        hasNextPage = false;
+      }
+    } // while hasNextPage
+    
+    Logger.log("[INFO] Finished chunk " + subMinStar + ".." + subMaxStar);
+  } catch (err) {
+    Logger.log("[ERROR] Exception in chunk " + subMinStar + ".." + subMaxStar + ": " + err);
+  }
+  
+  // Rename the sheet with final stats
+  var finalSheetName = "top_repos_" + subMinStar + "_to_" + subMaxStar + "_" +
+                       repositoryCount + "_" + totalFetched + "_" + breakAt;
+  // Truncate if too long
+  if (finalSheetName.length > 100) {
+    finalSheetName = finalSheetName.substring(0, 100);
+  }
+  try {
+    outputSheet.setName(finalSheetName);
+  } catch (renameErr) {
+    Logger.log("[WARN] Could not rename sheet to: " + finalSheetName);
+    Logger.log("[WARN] " + renameErr);
+  }
+  
+  Logger.log("[DEBUG] Done. Wrote " + totalFetched + " repos for chunk " + 
+             subMinStar + ".." + subMaxStar + " in sheet: " + outputSheet.getName());
+
+  // Return the final sheet name so we can combine later
+  return finalSheetName;
+}
+
+
+/**
+ * Helper function that tries GitHub GraphQL up to `maxRetries` times.
+ * Returns a successful response, or null if all attempts fail.
+ */
+function fetchGraphQLWithRetries(payload, githubToken, maxRetries) {
+  var attempt = 0;
+  var lastError = null;
+
+  while (attempt < maxRetries) {
+    attempt++;
+    try {
+      var params = {
+        method: "post",
+        contentType: "application/json",
+        headers: {
+          "Authorization": "Bearer " + githubToken
+        },
+        payload: payload,
+        muteHttpExceptions: true
+      };
+
+      Logger.log("[DEBUG] Attempt " + attempt + " to fetch GitHub GraphQL...");
+      var response = UrlFetchApp.fetch("https://api.github.com/graphql", params);
+
+      if (response.getResponseCode() === 200) {
+        Utilities.sleep(1000); // small delay after success
+        return response;
+      }
+
+      // Otherwise, log the error
+      Logger.log("[WARN] Attempt " + attempt + " failed with code " + response.getResponseCode());
+      Logger.log("[WARN] Body: " + response.getContentText());
+      lastError = "HTTP " + response.getResponseCode();
+    } catch (err) {
+      Logger.log("[ERROR] Exception on attempt " + attempt + ": " + err);
+      lastError = err.toString();
+    }
+
+    // Sleep 3s before retrying
+    Utilities.sleep(3000);
+  }
+
+  Logger.log("[ERROR] Exhausted " + maxRetries + " attempts. Last error: " + lastError);
+  return null;
+}
+
+
+/**
+ * Combines all the "chunk" sheets (temp_repos_...) into a single master sheet.
+ * - Creates or overwrites a master sheet with just 1 header row.
+ * - Copies data from each chunk sheet, ignoring its header row.
+ * - Deletes the chunk sheet afterwards (optional).
+ *
+ * @param {string[]} sheetNames - An array of sheet names that we want to combine.
+ * @param {string} masterSheetName - The final master sheet name (e.g. "AllRepos_20001_25000").
+ */
+function combineSheetsIntoMaster(sheetNames, masterSheetName) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // If a master sheet with this name already exists, delete it or rename it
+  var existing = ss.getSheetByName(masterSheetName);
+  if (existing) {
+    ss.deleteSheet(existing);
+  }
+  
+  // Create a fresh master sheet
+  var masterSheet = ss.insertSheet(masterSheetName);
+  
+  // Write the header row
+  masterSheet.getRange(1, 1, 1, 5).setValues([[
+    "Repo URL", "Number of Stars", "Website URL", "Last Activity Date", "Cursor"
+  ]]);
+  
+  var masterCurrentRow = 2; // We'll append data starting at row 2
+  
+  // For each chunk sheet
+  for (var i = 0; i < sheetNames.length; i++) {
+    var sheetName = sheetNames[i];
+    var chunkSheet = ss.getSheetByName(sheetName);
+    if (!chunkSheet) {
+      Logger.log("[WARN] Sheet " + sheetName + " not found, skipping.");
+      continue;
+    }
+    
+    // Figure out how many rows of data it has
+    // (minus 1 for the header)
+    var lastRow = chunkSheet.getLastRow();
+    if (lastRow < 2) {
+      // Means no data or only header
+      Logger.log("[INFO] Sheet " + sheetName + " has no data, skipping.");
+      continue;
+    }
+    
+    // Copy everything except the header row
+    var numRows = lastRow - 1; // ignoring the header
+    var data = chunkSheet.getRange(2, 1, numRows, 5).getValues();
+    
+    // Write to the master sheet
+    masterSheet.getRange(masterCurrentRow, 1, numRows, 5).setValues(data);
+    masterCurrentRow += numRows;
+    
+    // Delete the chunk sheet (optional, comment out if you want to keep)
+    ss.deleteSheet(chunkSheet);
+  }
+  
+  Logger.log("[INFO] Combined " + sheetNames.length + " chunk sheets into '" + masterSheetName + "'");
+  Logger.log("[INFO] The master sheet has " + (masterCurrentRow - 2) + " data rows (excluding header).");
+}
